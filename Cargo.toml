@@ -1,0 +1,40 @@
+[package]
+name = "pg-osc"
+version = "0.10.0"
+edition = "2021"
+description = "Online schema change for PostgreSQL with minimal locks (Rust port of pg-osc)"
+license = "MIT"
+rust-version = "1.85"
+
+[[bin]]
+name = "pg-online-schema-change"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+gethostname = "1"
+getrandom = "0.3"
+native-tls = { version = "0.2", features = ["vendored"] }
+pg_query = "18"
+postgres = "0.19"
+postgres-native-tls = "0.5"
+serde_json = { version = "1", features = ["preserve_order"] }
+signal-hook = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[package.metadata.deb]
+maintainer = "Evgeny Bezruchkin <evgeny.bezruchkin@flant.com>"
+section = "database"
+priority = "optional"
+depends = "libc6 (>= 2.34)"
+extended-description = "pg-online-schema-change: ALTER TABLE on busy PostgreSQL tables through a shadow table, with a short ACCESS EXCLUSIVE lock for the swap. Supports copying a filtered subset of rows and swapping on demand."
+assets = [
+  ["target/release/pg-online-schema-change", "usr/bin/", "755"],
+  ["README.md", "usr/share/doc/pg-osc/README.md", "644"],
+]

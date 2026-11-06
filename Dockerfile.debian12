@@ -1,0 +1,14 @@
+# Native build inside Debian 12:
+#   docker build --platform linux/amd64 -f Dockerfile.debian12 --output dist .
+FROM rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends clang libclang-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install cargo-deb --locked
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked \
+    && cargo deb --no-build --output /out/ \
+    && cp target/release/pg-online-schema-change /out/
+
+FROM scratch
+COPY --from=build /out/ /
