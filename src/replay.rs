@@ -56,13 +56,7 @@ impl Ctx {
             .ok_or_else(|| anyhow!("no primary key"))?;
         let filter = self.opts.filter.clone().unwrap_or_else(|| "TRUE".into());
         // the primary key may be renamed by the ALTER
-        let shadow_pk = quote_ident(
-            self.renamed_columns
-                .iter()
-                .find(|(old, _)| *old == primary_key)
-                .map(|(_, new)| new.as_str())
-                .unwrap_or(&primary_key),
-        );
+        let shadow_pk = self.shadow_primary_key()?;
 
         let mut replayed = String::new();
         let mut audit_ids = Vec::with_capacity(rows.len());

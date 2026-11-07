@@ -42,6 +42,10 @@ fn args(schema: &str, alter: &str) -> PerformArgs {
         filter: None,
         wait_for_swap: false,
         sync_interval: 0.05,
+        copy_batch_pages: None,
+        defer_indexes: false,
+        maintenance_work_mem: None,
+        skip_vacuum: false,
     }
 }
 
@@ -497,4 +501,220 @@ fn swap_request_errors() {
     let t = TestDb::new("swap_errors");
     let err = request_swap(&conn(&t.schema), &t.schema, "books").unwrap_err();
     assert!(err.to_string().contains("No running pg-osc sync"));
+}
+
+#[test]
+fn binary_reports_setup_errors() {
+    // used to exit with 1 without a single log line
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pg-online-schema-change"))
+        .args([
+            "perform",
+            "-a",
+            "ALTER TABLE b ALTER COLUMN stock_id SET NOT NULL",
+            "-d",
+            "no_such_db_pgosc",
+            "-h",
+            "127.0.0.1",
+            "-u",
+            "postgres",
+            "-p",
+            "1",
+            "--filter",
+            "WHERE stock_id IS NOT NULL",
+            "--wait-for-swap",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stdout.contains("\"msg\":\"Setup failed: "), "{stdout}");
+    assert!(
+        stdout.contains("\"dbname\":\"no_such_db_pgosc\""),
+        "{stdout}"
+    );
+}
+
+/// Table like the production `barcode`: uuid primary key, unique column,
+/// nullable stock_id, plain index. Writes keep going during the copy, the
+/// sync and up to the swap; afterwards the new table must equal the old one
+/// (filtered).
+fn copy_under_load(name: &str, batch_pages: Option<u64>, defer: bool, filter: bool) {
+    let mut t = TestDb::new(name);
+    let s = t.schema.clone();
+    t.exec(&format!(
+        r#"SET search_path TO "{s}";
+        CREATE TABLE barcode (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          stock_id int,
+          barcode text NOT NULL UNIQUE,
+          quantity int,
+          marked boolean,
+          is_child boolean
+        );
+        CREATE INDEX barcode_stock_id_idx ON barcode (stock_id);
+        INSERT INTO barcode (stock_id, barcode, quantity, marked, is_child)
+          SELECT CASE WHEN g % 4 = 0 THEN NULL ELSE g % 1000 END, 'bc' || g, g % 7, g % 2 = 0, false
+          FROM generate_series(1, 40000) g;"#
+    ));
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let writer = {
+        let (stop, writes, s) = (stop.clone(), writes.clone(), s.clone());
+        std::thread::spawn(move || {
+            let mut db = Db::connect(&conn(&s)).unwrap();
+            db.run(&format!("SET search_path TO \"{s}\""), false)
+                .unwrap();
+            let mut n: u64 = 0;
+            while !stop.load(Ordering::SeqCst) {
+                n += 1;
+                let pick = "SELECT id FROM barcode TABLESAMPLE SYSTEM (2) LIMIT 5";
+                let sql = match n % 6 {
+                    // non-HOT: unique column changes, row moves to another page
+                    0 => format!("UPDATE barcode SET barcode = barcode || '-{n}', quantity = quantity + 1 WHERE id IN ({pick})"),
+                    // moves rows in and out of the filter
+                    1 => format!("UPDATE barcode SET stock_id = NULL WHERE id IN ({pick})"),
+                    2 => format!("UPDATE barcode SET stock_id = {} WHERE id IN ({pick})", n % 1000),
+                    3 => format!("INSERT INTO barcode (stock_id, barcode, quantity) VALUES ({}, 'new{n}', 1), (NULL, 'newnull{n}', 1)", n % 1000),
+                    4 => format!("DELETE FROM barcode WHERE id IN ({pick})"),
+                    _ => format!("UPDATE barcode SET marked = NOT coalesce(marked, false) WHERE id IN ({pick})"),
+                };
+                if db.run(&sql, false).is_ok() {
+                    writes.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        })
+    };
+
+    let mut a = args(
+        &s,
+        "ALTER TABLE barcode ALTER COLUMN stock_id SET NOT NULL;",
+    );
+    a.copy_batch_pages = batch_pages;
+    a.defer_indexes = defer;
+    a.maintenance_work_mem = defer.then(|| "64MB".to_string());
+    a.wait_for_swap = true;
+    if filter {
+        a.filter = Some("stock_id IS NOT NULL".into());
+    } else {
+        a.alter_statement = "ALTER TABLE barcode ADD COLUMN note text;".into();
+    }
+    let (_flags, handle) = spawn_perform(a);
+
+    // keep writing during the sync for a while, then swap under load
+    wait_until("sync loop", || {
+        t.pgosc_tables().iter().any(|n| n.starts_with("pgosc_at_"))
+            && !t
+                .values(&format!(
+                    "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = '{s}' AND relname LIKE 'pgosc_at_%' AND reloptions @> ARRAY['autovacuum_enabled=true']"
+                ))
+                .is_empty()
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    // after the swap `barcode` is the new table and further writes would go
+    // there only, so stop writing first (whatever is left in the audit table
+    // is replayed by the swap itself)
+    stop.store(true, Ordering::SeqCst);
+    writer.join().unwrap();
+    request_swap(&conn(&s), &s, "barcode").unwrap();
+    handle.join().unwrap().unwrap();
+    assert!(
+        writes.load(Ordering::SeqCst) > 50,
+        "the writer did too little"
+    );
+
+    t.exec(&format!("SET search_path TO \"{s}\""));
+    let cols = "id, stock_id, barcode, quantity, marked, is_child";
+    let old = if filter {
+        "pgosc_op_table_barcode WHERE stock_id IS NOT NULL"
+    } else {
+        "pgosc_op_table_barcode"
+    };
+    // no writes since before the swap: both tables must be equal
+    let diff = t.values(&format!(
+        "SELECT (SELECT count(*) FROM (SELECT {cols} FROM barcode EXCEPT SELECT {cols} FROM {old}) d),
+                (SELECT count(*) FROM (SELECT {cols} FROM {old} EXCEPT SELECT {cols} FROM barcode) d),
+                (SELECT count(*) FROM barcode), (SELECT count(*) FROM {old})"
+    ));
+    let parts: Vec<&str> = diff[0].split('|').collect();
+    assert_eq!((parts[0], parts[1]), ("0", "0"), "new vs old: {diff:?}");
+    assert_eq!(parts[2], parts[3]);
+    assert!(parts[2].parse::<u64>().unwrap() > 20000);
+
+    // indexes and constraints are back, primary key included
+    assert_eq!(
+        t.values(
+            "SELECT string_agg(contype::text, ',' ORDER BY contype) FROM pg_constraint WHERE conrelid = 'barcode'::regclass AND contype IN ('p','u')"
+        ),
+        vec!["p,u"]
+    );
+    assert_eq!(
+        t.values("SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema AND tablename = 'barcode'"),
+        vec!["3"]
+    );
+    if filter {
+        assert_eq!(
+            t.values("SELECT attnotnull FROM pg_attribute WHERE attrelid = 'barcode'::regclass AND attname = 'stock_id'"),
+            vec!["t"]
+        );
+    }
+}
+
+#[test]
+fn batched_copy_deferred_indexes_filter_under_load() {
+    copy_under_load("batched_defer_filter", Some(1), true, true);
+}
+
+#[test]
+fn batched_copy_with_indexes_under_load() {
+    copy_under_load("batched_indexes", Some(3), false, false);
+}
+
+#[test]
+fn deferred_indexes_single_copy_under_load() {
+    copy_under_load("defer_single", None, true, true);
+}
+
+#[test]
+fn batched_copy_option_conflicts() {
+    let mut a = args("s", "ALTER TABLE books ADD COLUMN a int");
+    a.copy_batch_pages = Some(0);
+    assert!(Options::from_args(&a)
+        .unwrap_err()
+        .to_string()
+        .contains("> 0"));
+    a.copy_batch_pages = Some(100);
+    a.copy_statement = Some("Cargo.toml".into());
+    assert!(Options::from_args(&a)
+        .unwrap_err()
+        .to_string()
+        .contains("can't be used together"));
+}
+
+fn vacuum_count_of_old_table(t: &mut TestDb) -> String {
+    let s = t.schema.clone();
+    t.values(&format!(
+        "SELECT vacuum_count FROM pg_stat_user_tables WHERE schemaname = '{s}' AND relname = 'pgosc_op_table_books'"
+    ))[0]
+        .clone()
+}
+
+#[test]
+fn vacuum_runs_by_default_and_can_be_skipped() {
+    for (name, skip, expected) in [
+        ("vacuum_default", false, "1"),
+        ("vacuum_skipped", true, "0"),
+    ] {
+        let mut t = TestDb::new(name);
+        let s = t.schema.clone();
+        let mut a = args(
+            &s,
+            "ALTER TABLE books ADD COLUMN purchased BOOLEAN DEFAULT FALSE;",
+        );
+        a.skip_vacuum = skip;
+        orchestrate::run(Options::from_args(&a).unwrap(), Arc::new(Flags::default())).unwrap();
+        // the stats belong to the relation, which is the old table after the swap
+        assert_eq!(vacuum_count_of_old_table(&mut t), expected, "{name}");
+    }
 }

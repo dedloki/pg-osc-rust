@@ -60,7 +60,81 @@ pub fn get_table_size(db: &mut Db, schema: &str, table_name: &str) -> i64 {
     }
 }
 
+/// An index of the shadow table, with the constraint it backs (p, u or x).
+#[derive(Clone, Debug)]
+pub struct ShadowIndex {
+    /// as regclass prints it (quoted if needed)
+    pub name: String,
+    pub indexdef: String,
+    pub is_primary: bool,
+    pub conname: Option<String>,
+    pub contype: Option<String>,
+    pub condef: Option<String>,
+}
+
 impl Ctx {
+    pub fn server_version_num(&mut self) -> Result<i64> {
+        Ok(self
+            .db
+            .first_value("SHOW server_version_num;", false)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// Heap pages of the table right now.
+    pub fn relation_pages(&mut self, table: &str) -> Result<u64> {
+        let sql = format!(
+            "SELECT pg_relation_size({}::regclass) / current_setting('block_size')::bigint;",
+            quote_literal(&self.qualified(table))
+        );
+        Ok(self
+            .db
+            .first_value(&sql, false)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// Indexes of the shadow table, primary key first.
+    pub fn shadow_indexes(&mut self, reuse: bool) -> Result<Vec<ShadowIndex>> {
+        let sql = format!(
+            "SELECT i.indexrelid::regclass::text AS name, pg_get_indexdef(i.indexrelid) AS indexdef,
+                    i.indisprimary AS is_primary, c.conname, c.contype, pg_get_constraintdef(c.oid) AS condef
+             FROM pg_index i
+             LEFT JOIN pg_constraint c ON c.conindid = i.indexrelid AND c.conrelid = i.indrelid
+                                      AND c.contype IN ('p', 'u', 'x')
+             WHERE i.indrelid = {}::regclass
+             ORDER BY i.indisprimary DESC, i.indexrelid;",
+            quote_literal(&self.qualified(&self.shadow_table))
+        );
+        Ok(self
+            .db
+            .run(&sql, reuse)?
+            .iter()
+            .map(|r| ShadowIndex {
+                name: val(r, "name"),
+                indexdef: val(r, "indexdef"),
+                is_primary: r.get("is_primary") == Some("t"),
+                conname: r.get("conname").map(str::to_string),
+                contype: r.get("contype").map(str::to_string),
+                condef: r.get("condef").map(str::to_string),
+            })
+            .collect())
+    }
+
+    /// Primary key column of the shadow table (renamed by the ALTER, if so), quoted.
+    pub fn shadow_primary_key(&mut self) -> Result<String> {
+        let pk = self
+            .primary_key()?
+            .ok_or_else(|| anyhow::anyhow!("no primary key"))?;
+        Ok(quote_ident(
+            self.renamed_columns
+                .iter()
+                .find(|(old, _)| *old == pk)
+                .map(|(_, new)| new.as_str())
+                .unwrap_or(&pk),
+        ))
+    }
+
     /// schema-qualified, for regclass casts
     fn qualified(&self, table: &str) -> String {
         format!("{}.{}", quote_ident(&self.opts.schema), table)

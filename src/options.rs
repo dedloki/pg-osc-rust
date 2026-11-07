@@ -113,6 +113,18 @@ pub struct PerformArgs {
     /// With --wait-for-swap: seconds to sleep between replay iterations once caught up.
     #[arg(long, default_value_t = SYNC_INTERVAL)]
     pub sync_interval: f64,
+    /// Copy in separate short transactions of N heap pages each, by ctid ranges (PostgreSQL 14+), instead of one INSERT ... SELECT in one long transaction. No long-lived snapshot holding back vacuum; rows changed during the copy are taken from the audit table. 8kB pages: 10000 pages = ~80MB per transaction.
+    #[arg(long, value_name = "N")]
+    pub copy_batch_pages: Option<u64>,
+    /// Build the shadow table's indexes, primary key and unique constraints after the copy instead of maintaining them row by row during it. Much faster for big tables.
+    #[arg(long)]
+    pub defer_indexes: bool,
+    /// maintenance_work_mem for building the deferred indexes, e.g. 4GB
+    #[arg(long, value_name = "SIZE")]
+    pub maintenance_work_mem: Option<String>,
+    /// Don't VACUUM the table before starting (the copy doesn't need it; on a big table it can take long)
+    #[arg(long)]
+    pub skip_vacuum: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -140,6 +152,10 @@ pub struct Options {
     pub filter: Option<String>,
     pub wait_for_swap: bool,
     pub sync_interval: f64,
+    pub copy_batch_pages: Option<u64>,
+    pub defer_indexes: bool,
+    pub maintenance_work_mem: Option<String>,
+    pub skip_vacuum: bool,
     /// table as Postgres sees it (unquoted)
     pub table: String,
     /// table as it goes into SQL (quoted if needed)
@@ -182,6 +198,14 @@ impl Options {
         if a.sync_interval.is_nan() || a.sync_interval < 0.0 {
             bail!("--sync-interval should be >= 0");
         }
+        if let Some(pages) = a.copy_batch_pages {
+            if pages == 0 {
+                bail!("--copy-batch-pages should be > 0");
+            }
+            if copy_statement.is_some() {
+                bail!("--copy-batch-pages and --copy-statement can't be used together");
+            }
+        }
 
         let table = sql::table(&alter)?;
         let table_name = sql::table_name(&alter, &table);
@@ -200,6 +224,10 @@ impl Options {
             filter,
             wait_for_swap: a.wait_for_swap,
             sync_interval: a.sync_interval,
+            copy_batch_pages: a.copy_batch_pages,
+            defer_indexes: a.defer_indexes,
+            maintenance_work_mem: a.maintenance_work_mem.clone(),
+            skip_vacuum: a.skip_vacuum,
             table,
             table_name,
         })

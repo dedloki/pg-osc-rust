@@ -81,7 +81,27 @@ impl Db {
     }
 
     pub fn run(&mut self, sql: &str, reuse_transaction: bool) -> Result<Vec<Row>> {
-        crate::debug!("Running query", { "query": sql });
+        Ok(to_rows(self.run_messages(sql, reuse_transaction)?))
+    }
+
+    /// Like run, returns the number of rows the statements touched.
+    pub fn execute(&mut self, sql: &str, reuse_transaction: bool) -> Result<u64> {
+        Ok(self
+            .run_messages(sql, reuse_transaction)?
+            .iter()
+            .map(|m| match m {
+                SimpleQueryMessage::CommandComplete(n) => *n,
+                _ => 0,
+            })
+            .sum())
+    }
+
+    fn run_messages(
+        &mut self,
+        sql: &str,
+        reuse_transaction: bool,
+    ) -> Result<Vec<SimpleQueryMessage>> {
+        crate::debug!("Running query", { "query": shorten(sql) });
 
         // BEGIN inside an open transaction is only a warning, same as in the Ruby version
         let result = self
@@ -94,10 +114,10 @@ impl Db {
                 if !reuse_transaction {
                     self.client.batch_execute("COMMIT;")?;
                 }
-                Ok(to_rows(messages))
+                Ok(messages)
             }
             Err(e) => {
-                crate::info!("Exception raised, rolling back query", { "rollback": true, "query": sql });
+                crate::info!("Exception raised, rolling back query", { "rollback": true, "query": shorten(sql) });
                 let _ = self.client.batch_execute("ROLLBACK;");
                 Err(e.into())
             }
@@ -106,7 +126,7 @@ impl Db {
 
     /// Outside of any transaction (VACUUM can't run in one).
     pub fn exec_raw(&mut self, sql: &str) -> Result<()> {
-        crate::debug!("Running query", { "query": sql });
+        crate::debug!("Running query", { "query": shorten(sql) });
         Ok(self.client.batch_execute(sql)?)
     }
 
@@ -117,6 +137,20 @@ impl Db {
             .next()
             .and_then(|r| r.values.into_iter().next().flatten()))
     }
+}
+
+const LOGGED_QUERY_LIMIT: usize = 2000;
+
+/// Replay batches are thousands of statements: log only the head of them.
+fn shorten(sql: &str) -> String {
+    if sql.len() <= LOGGED_QUERY_LIMIT {
+        return sql.to_string();
+    }
+    let mut end = LOGGED_QUERY_LIMIT;
+    while !sql.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... ({} bytes total)", &sql[..end], sql.len())
 }
 
 fn to_rows(messages: Vec<SimpleQueryMessage>) -> Vec<Row> {
@@ -138,4 +172,18 @@ pub fn sqlstate(e: &anyhow::Error) -> Option<&SqlState> {
 
 pub fn is_pg_error(e: &anyhow::Error) -> bool {
     e.downcast_ref::<postgres::Error>().is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_queries_are_shortened_in_logs() {
+        assert_eq!(shorten("SELECT 1"), "SELECT 1");
+        let long = "я".repeat(3000); // 2 bytes per char, cut must stay on a char boundary
+        let s = shorten(&long);
+        assert!(s.ends_with("... (6000 bytes total)"));
+        assert!(s.len() < 2100);
+    }
 }

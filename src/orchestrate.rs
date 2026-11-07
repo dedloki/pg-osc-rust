@@ -46,7 +46,18 @@ pub fn setup(opts: Options, flags: Arc<Flags>) -> Result<Ctx> {
 /// `perform`: on failure the trigger, audit and shadow tables are removed,
 /// the old table never (with --filter it holds the filtered-out rows).
 pub fn run(opts: Options, flags: Arc<Flags>) -> Result<()> {
-    let mut ctx = setup(opts, flags)?;
+    let target = serde_json::json!({
+        "host": opts.conn.host, "port": opts.conn.port, "dbname": opts.conn.dbname,
+        "username": opts.conn.user, "schema": opts.schema, "table": opts.table_name,
+    });
+    // nothing to clean up yet, but the error must not go unnoticed
+    let mut ctx = match setup(opts, flags) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            crate::fatal!(format!("Setup failed: {e:#}"), { "target": target });
+            return Err(e);
+        }
+    };
     match run_steps(&mut ctx) {
         Ok(()) => {
             crate::info!("All tasks successfully completed");
@@ -70,16 +81,27 @@ fn run_steps(ctx: &mut Ctx) -> Result<()> {
     if ctx.primary_key()?.is_none() {
         bail!("Parent table has no primary key, exiting...");
     }
+    if ctx.batched() {
+        let version = ctx.server_version_num()?;
+        if version < 140000 {
+            bail!("--copy-batch-pages needs PostgreSQL 14+ (TID range scans), the server is {version}");
+        }
+    }
 
     crate::info!("Performing some house keeping....");
     ctx.run_analyze()?;
-    ctx.run_vacuum()?;
+    if ctx.opts.skip_vacuum {
+        crate::info!("Skipping VACUUM (--skip-vacuum)");
+    } else {
+        ctx.run_vacuum()?;
+    }
 
     ctx.setup_audit_table()?;
     ctx.setup_trigger()?;
-    ctx.setup_shadow_table()?; // starts the serializable transaction
+    ctx.setup_shadow_table()?; // starts the serializable transaction (not with --copy-batch-pages)
     ctx.run_alter_statement()?; // same transaction
     ctx.copy_data()?; // same transaction, commits it
+    ctx.finish_copy()?; // dedup after batches, deferred indexes
     ctx.run_analyze()?;
     ctx.replay_and_swap()?;
     ctx.run_analyze()?;
@@ -90,6 +112,11 @@ fn run_steps(ctx: &mut Ctx) -> Result<()> {
 }
 
 impl Ctx {
+    /// --copy-batch-pages: copy in short transactions instead of one serializable one
+    pub fn batched(&self) -> bool {
+        self.opts.copy_batch_pages.is_some()
+    }
+
     pub fn setup_audit_table(&mut self) -> Result<()> {
         crate::info!("Setting up audit table", { "audit_table": self.audit_table });
         let sql = format!(
@@ -158,14 +185,17 @@ FOR EACH ROW EXECUTE PROCEDURE primary_to_audit_table_trigger();
             quote_literal(&self.shadow_table)
         );
         self.db.run(&sql, false)?;
-        self.db
-            .run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", true)?;
+        let serial = !self.batched();
+        if serial {
+            self.db
+                .run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", true)?;
+        }
         let sql = format!(
             "SELECT fix_serial_sequence({}, {});",
             quote_literal(&self.opts.table_name),
             quote_literal(&self.shadow_table)
         );
-        self.db.run(&sql, true)?;
+        self.db.run(&sql, serial)?;
         Ok(())
     }
 
@@ -173,13 +203,41 @@ FOR EACH ROW EXECUTE PROCEDURE primary_to_audit_table_trigger();
         let statement = alter_statement_for(&self.opts.alter_statement, &self.shadow_table)?;
         crate::info!("Running alter statement on shadow table",
             { "shadow_table": self.shadow_table, "parent_table": self.opts.table_name });
-        self.db.run(&statement, true)?;
+        let serial = !self.batched();
+        self.db.run(&statement, serial)?;
         self.dropped_columns = dropped_columns(&self.opts.alter_statement);
         self.renamed_columns = renamed_columns(&self.opts.alter_statement);
+        if self.opts.defer_indexes {
+            self.drop_shadow_indexes(serial)?;
+        }
+        Ok(())
+    }
+
+    /// --defer-indexes: remember the shadow table's indexes (as they are after
+    /// the ALTER) and drop them, finish_copy builds them again.
+    fn drop_shadow_indexes(&mut self, reuse: bool) -> Result<()> {
+        let indexes = self.shadow_indexes(reuse)?;
+        for idx in &indexes {
+            let sql = match &idx.conname {
+                Some(con) => format!(
+                    "ALTER TABLE {} DROP CONSTRAINT {};",
+                    self.shadow_table,
+                    quote_ident(con)
+                ),
+                None => format!("DROP INDEX {};", idx.name),
+            };
+            self.db.run(&sql, reuse)?;
+        }
+        crate::info!("Indexes of the shadow table deferred till after the copy",
+            { "indexes": indexes.iter().map(|i| i.name.clone()).collect::<Vec<_>>() });
+        self.deferred_indexes = indexes;
         Ok(())
     }
 
     pub fn copy_data(&mut self) -> Result<()> {
+        if self.batched() {
+            return self.copy_data_batched();
+        }
         let finished = Arc::new(AtomicBool::new(false));
         let result = (|| -> Result<()> {
             crate::info!("Clearing contents of audit table before copy..",
@@ -203,6 +261,183 @@ FOR EACH ROW EXECUTE PROCEDURE primary_to_audit_table_trigger();
         finished.store(true, Ordering::SeqCst);
         let commit = self.db.run("COMMIT;", false); // commits the serializable transaction
         result.and(commit.map(|_| ()))
+    }
+
+    /// --copy-batch-pages: INSERT ... SELECT by ctid ranges, each batch in its
+    /// own transaction. Without one snapshot for the whole copy a row changed
+    /// meanwhile can be copied twice (old and new version in different
+    /// batches) or missed (new version in an already copied range). Every such
+    /// row was changed after the trigger was set up, so its primary key is in
+    /// the audit table: finish_copy removes those rows from the shadow table
+    /// and the replay of the full audit table brings them back in their final
+    /// state. That's why the audit table is not emptied here.
+    fn copy_data_batched(&mut self) -> Result<()> {
+        let pages_per_batch = self.opts.copy_batch_pages.unwrap_or(1);
+        let table = self.opts.table_name.clone();
+        let total_pages = self.relation_pages(&table)?;
+        let (insert, select) = self.copy_columns(false)?;
+        let filter = self
+            .opts
+            .filter
+            .as_ref()
+            .map(|f| format!(" AND ({f})"))
+            .unwrap_or_default();
+        // with the indexes in place a second version of a row would violate
+        // the primary key: skip it, finish_copy removes the row anyway
+        let on_conflict = if self.opts.defer_indexes {
+            ""
+        } else {
+            " ON CONFLICT DO NOTHING"
+        };
+
+        crate::info!("Copying contents in batches..", {
+            "shadow_table": self.shadow_table, "parent_table": table,
+            "pages": total_pages, "pages_per_batch": pages_per_batch,
+        });
+
+        let started = Instant::now();
+        let mut last_log = Instant::now();
+        let mut copied: u64 = 0;
+        let mut start: u64 = 0;
+        loop {
+            self.check_terminate()?;
+            let end = start + pages_per_batch;
+            // the last batch is open ended: pages added during the copy hold
+            // only rows written after the trigger, copying them is harmless
+            let last = end >= total_pages;
+            let range = if last {
+                format!("ctid >= '({start},0)'::tid")
+            } else {
+                format!("ctid >= '({start},0)'::tid AND ctid < '({end},0)'::tid")
+            };
+            let sql = format!(
+                "INSERT INTO {} ({}) SELECT {} FROM ONLY {} WHERE {}{}{};",
+                self.shadow_table,
+                insert.join(", "),
+                select.join(", "),
+                table,
+                range,
+                filter,
+                on_conflict
+            );
+            copied += self.db.execute(&sql, false)?;
+
+            let done = end.min(total_pages);
+            if last || last_log.elapsed() >= TRACK_PROGRESS_INTERVAL {
+                let pct = if total_pages == 0 {
+                    100.0
+                } else {
+                    done as f64 / total_pages as f64 * 100.0
+                };
+                let elapsed = started.elapsed().as_secs();
+                let eta = if done > 0 && !last {
+                    (elapsed as f64 * (total_pages - done) as f64 / done as f64) as u64
+                } else {
+                    0
+                };
+                crate::info!(format!("Copy progress: {pct:.2}% of pages"), {
+                    "pages_done": done, "pages_total": total_pages, "rows_copied": copied,
+                    "elapsed_s": elapsed, "eta_s": eta,
+                });
+                last_log = Instant::now();
+            }
+            if last {
+                break;
+            }
+            start = end;
+        }
+        crate::info!("Batched copy done", { "rows_copied": copied, "elapsed_s": started.elapsed().as_secs() });
+        Ok(())
+    }
+
+    /// After the copy: drop rows changed during a batched copy (the replay
+    /// rebuilds them), build the deferred indexes, ANALYZE the shadow table.
+    pub fn finish_copy(&mut self) -> Result<()> {
+        if self.batched() {
+            self.check_terminate()?;
+            let pk = self
+                .primary_key()?
+                .ok_or_else(|| anyhow!("no primary key"))?;
+            let shadow_pk = self.shadow_primary_key()?;
+            let started = Instant::now();
+            let sql = format!(
+                "DELETE FROM {} s USING (SELECT DISTINCT {} AS k FROM {}) a WHERE s.{} = a.k;",
+                self.shadow_table,
+                quote_ident(&pk),
+                self.audit_table,
+                shadow_pk
+            );
+            let removed = self.db.execute(&sql, false)?;
+            crate::info!("Removed rows changed during the copy, the replay brings them back",
+                { "rows": removed, "elapsed_s": started.elapsed().as_secs() });
+        }
+
+        if self.opts.defer_indexes && !self.deferred_indexes.is_empty() {
+            self.build_deferred_indexes()?;
+        }
+
+        if self.batched() || self.opts.defer_indexes {
+            crate::info!("Performing ANALYZE on the shadow table!");
+            self.db
+                .exec_raw(&format!("ANALYZE {};", self.shadow_table))?;
+        }
+        Ok(())
+    }
+
+    fn build_deferred_indexes(&mut self) -> Result<()> {
+        if let Some(mem) = self.opts.maintenance_work_mem.clone() {
+            self.db.run(
+                &format!("SET maintenance_work_mem = {};", quote_literal(&mem)),
+                false,
+            )?;
+        }
+        let indexes = std::mem::take(&mut self.deferred_indexes);
+        let total = indexes.len();
+        for (n, idx) in indexes.iter().enumerate() {
+            self.check_terminate()?;
+            crate::info!(format!("Building index {}/{}", n + 1, total),
+                { "index": idx.name, "constraint": idx.conname });
+            let started = Instant::now();
+            match (idx.contype.as_deref(), &idx.conname) {
+                (Some(kind @ ("p" | "u")), Some(con)) => {
+                    self.db.run(&idx.indexdef, false)?;
+                    let condef = idx.condef.clone().unwrap_or_default();
+                    let mut deferrable = String::new();
+                    if condef.contains("INITIALLY DEFERRED") {
+                        deferrable = " DEFERRABLE INITIALLY DEFERRED".into();
+                    } else if condef.contains("DEFERRABLE") && !condef.contains("NOT DEFERRABLE") {
+                        deferrable = " DEFERRABLE".into();
+                    }
+                    let sql = format!(
+                        "ALTER TABLE {} ADD CONSTRAINT {} {} USING INDEX {}{};",
+                        self.shadow_table,
+                        quote_ident(con),
+                        if kind == "p" { "PRIMARY KEY" } else { "UNIQUE" },
+                        idx.name,
+                        deferrable
+                    );
+                    self.db.run(&sql, false)?;
+                }
+                (Some("x"), Some(con)) => {
+                    let sql = format!(
+                        "ALTER TABLE {} ADD CONSTRAINT {} {};",
+                        self.shadow_table,
+                        quote_ident(con),
+                        idx.condef.clone().unwrap_or_default()
+                    );
+                    self.db.run(&sql, false)?;
+                }
+                _ => {
+                    self.db.run(&idx.indexdef, false)?;
+                }
+            }
+            crate::info!(format!("Index {}/{} built", n + 1, total),
+                { "index": idx.name, "elapsed_s": started.elapsed().as_secs() });
+        }
+        if self.opts.maintenance_work_mem.is_some() {
+            self.db.run("RESET maintenance_work_mem;", false)?;
+        }
+        Ok(())
     }
 
     /// Estimated copy progress every minute from a second connection.

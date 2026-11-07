@@ -67,6 +67,8 @@ pub struct Ctx {
     pub renamed_columns: Vec<(String, String)>,
     /// (insert into columns, select columns) for the replay, cached
     pub copy_columns_cache: Option<(Vec<String>, Vec<String>)>,
+    /// indexes and constraints removed from the shadow table for --defer-indexes
+    pub deferred_indexes: Vec<crate::query::ShadowIndex>,
 }
 
 impl Ctx {
@@ -88,6 +90,7 @@ impl Ctx {
             dropped_columns: vec![],
             renamed_columns: vec![],
             copy_columns_cache: None,
+            deferred_indexes: vec![],
             opts,
             db,
             flags,

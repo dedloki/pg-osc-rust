@@ -50,6 +50,24 @@ pg-online-schema-change perform \
 - On failure the old table is never dropped, even with `--drop`.
 - Foreign keys from other tables pointing to filtered-out rows fail `VALIDATE CONSTRAINT` after the swap (the swap is done by then, the constraints stay `NOT VALID`). Fix those rows first or use `--skip-foreign-key-validation`.
 
+### Big tables: batched copy and deferred indexes
+
+By default the copy is one `INSERT ... SELECT` in one SERIALIZABLE transaction, into a shadow table that already has all indexes. On a table with hundreds of millions of rows that means many hours of an open snapshot (vacuum can't remove dead rows anywhere in the database meanwhile, the xid horizon doesn't move) and an index insert per row per index.
+
+```
+pg-online-schema-change perform \
+  --alter-statement 'ALTER TABLE barcode ALTER COLUMN stock_id SET NOT NULL' \
+  --filter 'stock_id IS NOT NULL' --wait-for-swap \
+  --copy-batch-pages 10000 --defer-indexes --maintenance-work-mem 4GB \
+  --dbname mydb --host db.host --username myuser
+```
+
+- `--copy-batch-pages N` (PostgreSQL 14+) copies by ctid ranges of N heap pages (8kB each), every batch in its own short transaction, so the primary key type doesn't matter (uuid is fine). Without one snapshot a row changed during the copy can be copied twice or missed; every such row was changed after the trigger was set up, so it is in the audit table. After the copy the shadow rows whose primary key is in the audit table are deleted and the replay of the whole audit table brings them back in their final state. Progress is logged every minute with pages done and an ETA.
+- `--defer-indexes` drops the shadow table's indexes, primary key and unique/exclusion constraints after the `ALTER` and builds them after the copy (primary key first), one sorted build per index instead of a random insert per row. Watch it in `pg_stat_progress_create_index`. `--maintenance-work-mem` is set for those builds; parallel workers follow `max_parallel_maintenance_workers`.
+- Both work with `--filter`, together or apart. `--copy-batch-pages` can't be combined with `--copy-statement`.
+- `--skip-vacuum` skips the `VACUUM` of the table that pg-osc runs before starting (kept from upstream as "house keeping"). The copy doesn't depend on it; it mainly sets hint bits and the visibility map, which matters only if the table has a lot of recently changed rows that autovacuum hasn't processed yet.
+- `--verbose` logs only the first 2000 characters of each query (replay batches are thousands of statements).
+
 ## Differences from the Ruby version
 
 - The replay copies rows with `INSERT ... SELECT` from the audit table instead of re-sending values as text literals. `UPDATE ... SET col = NULL` is replayed (the Ruby version dropped NULL values from replayed rows, so such updates were lost), and the types never round-trip through text.
