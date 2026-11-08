@@ -4,7 +4,7 @@
 use crate::db::Db;
 use crate::options::Options;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Flags set from the signal thread.
 #[derive(Default, Debug)]
@@ -12,9 +12,22 @@ pub struct Flags {
     pub swap_requested: AtomicBool,
     /// signal number that asked us to stop, 0 = none
     pub terminate: AtomicI32,
+    /// SQL to clean up by hand, logged when we exit without cleaning up
+    pub cleanup_sql: Mutex<Option<String>>,
 }
 
 impl Flags {
+    pub fn set_cleanup_sql(&self, sql: Option<String>) {
+        *self.cleanup_sql.lock().unwrap_or_else(|e| e.into_inner()) = sql;
+    }
+
+    pub fn cleanup_sql(&self) -> Option<String> {
+        self.cleanup_sql
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn terminating(&self) -> Option<i32> {
         match self.terminate.load(Ordering::SeqCst) {
             0 => None,

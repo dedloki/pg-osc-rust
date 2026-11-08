@@ -46,9 +46,21 @@ pg-online-schema-change perform \
   pg-online-schema-change swap --table books --schema public --dbname postgres --host localhost --username jamesbond
   ```
 
-  or `kill -USR1 <pid>` (the pid is in the logs). If the swap can't get its lock, the sync goes on and waits for the next request. `Ctrl-C`/`SIGTERM` stops it and removes the trigger, audit and shadow tables; a second signal exits immediately without cleanup.
+  or `kill -USR1 <pid>` (the pid is in the logs). If the swap can't get its lock, the sync goes on and waits for the next request. A stop signal removes the trigger, audit and shadow tables, see below.
 - On failure the old table is never dropped, even with `--drop`.
 - Foreign keys from other tables pointing to filtered-out rows fail `VALIDATE CONSTRAINT` after the swap (the swap is done by then, the constraints stay `NOT VALID`). Fix those rows first or use `--skip-foreign-key-validation`.
+
+### Stopping and cleanup
+
+`SIGTERM`, `SIGINT` (Ctrl-C), `SIGQUIT` and `SIGHUP` (closed ssh session, terminal or tmux window) stop the run and clean up: the audit trigger is dropped first, then the audit and shadow tables. `DROP TRIGGER` needs an `ACCESS EXCLUSIVE` lock on the table, so it is tried with `lock_timeout = --wait-time-for-lock` and retried until it gets through (each attempt is logged); writes to the table wait at most that long behind it, and keep going to the audit table meanwhile. A second signal exits at once and logs `cleanup_sql`, the statements to finish by hand. Drop the trigger before the audit table: while the trigger is there, dropping the audit table breaks every write to the table. `kill -9` leaves everything in place, clean up with the same statements:
+
+```
+SET lock_timeout = '5s';
+DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON public.<table>;  -- repeat until it succeeds
+RESET lock_timeout;
+DROP TABLE IF EXISTS public.pgosc_at_<table>_<id>;
+DROP TABLE IF EXISTS public.pgosc_st_<table>_<id>;
+```
 
 ### Big tables: batched copy and deferred indexes
 

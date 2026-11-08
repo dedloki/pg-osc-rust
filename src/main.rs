@@ -2,7 +2,7 @@ use clap::Parser;
 use pg_osc::ctx::{Flags, Terminated};
 use pg_osc::options::{Cli, Command, Options};
 use pg_osc::{db, log, orchestrate};
-use signal_hook::consts::{SIGINT, SIGQUIT, SIGTERM, SIGUSR1};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -49,11 +49,14 @@ fn main() -> ExitCode {
     }
 }
 
-/// USR1 requests the swap. TERM/INT/QUIT set the terminate flag and cancel
-/// the running query on the main connection; the main thread then cleans up
-/// (trigger, audit and shadow tables) and exits with 128+signal.
+/// USR1 requests the swap. TERM/INT/QUIT/HUP set the terminate flag and
+/// cancel the running query on the main connection; the main thread then
+/// cleans up (trigger, audit and shadow tables) and exits with 128+signal.
+/// HUP is there because a closed ssh session / terminal / tmux window sends
+/// it, and by default it kills the process without any cleanup.
 fn spawn_signal_handler(flags: Arc<Flags>) -> anyhow::Result<()> {
-    let mut signals = signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGQUIT, SIGUSR1])?;
+    let mut signals =
+        signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGQUIT, SIGHUP, SIGUSR1])?;
     std::thread::spawn(move || {
         for sig in signals.forever() {
             if sig == SIGUSR1 {
@@ -62,9 +65,18 @@ fn spawn_signal_handler(flags: Arc<Flags>) -> anyhow::Result<()> {
                 continue;
             }
             if flags.terminate.swap(sig, Ordering::SeqCst) != 0 {
-                pg_osc::warn!("Second signal received, exiting without cleanup");
+                match flags.cleanup_sql() {
+                    Some(sql) => pg_osc::warn!(
+                        "Second signal received, exiting without cleanup. Clean up by hand (drop the trigger first, it needs the lock; until then writes go to the audit table)",
+                        { "cleanup_sql": sql }
+                    ),
+                    None => pg_osc::warn!("Second signal received, exiting without cleanup"),
+                }
                 std::process::exit(128 + sig);
             }
+            pg_osc::info!(format!(
+                "Signal {sig} received, stopping and cleaning up (a second signal exits without cleanup)"
+            ));
             if let Some(token) = db::CANCEL.get() {
                 if let Ok(tls) = db::tls() {
                     let _ = token.cancel_query(tls);

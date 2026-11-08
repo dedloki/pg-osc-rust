@@ -1,7 +1,7 @@
 //! The whole operation (the Ruby Orchestrate class).
 
 use crate::ctx::{random_id, AccessExclusiveLockNotAcquired, Ctx, Flags};
-use crate::db::{is_pg_error, Db};
+use crate::db::{is_pg_error, sqlstate, Db};
 use crate::functions::{FUNC_CREATE_TABLE_ALL, FUNC_FIX_SERIAL_SEQUENCE};
 use crate::options::Options;
 use crate::query::get_table_size;
@@ -9,6 +9,7 @@ use crate::sql::{
     alter_statement_for, dropped_columns, quote_ident, quote_literal, renamed_columns,
 };
 use anyhow::{anyhow, bail, Result};
+use postgres::error::SqlState;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,6 +59,7 @@ pub fn run(opts: Options, flags: Arc<Flags>) -> Result<()> {
             return Err(e);
         }
     };
+    ctx.flags.set_cleanup_sql(Some(ctx.manual_cleanup_sql()));
     match run_steps(&mut ctx) {
         Ok(()) => {
             crate::info!("All tasks successfully completed");
@@ -70,7 +72,8 @@ pub fn run(opts: Options, flags: Arc<Flags>) -> Result<()> {
                 crate::fatal!(format!("Something went wrong: {e:#}"), { "e": format!("{e:?}") });
             }
             if let Err(cleanup) = ctx.drop_and_cleanup(false) {
-                crate::error!(format!("Cleanup failed: {cleanup:#}"));
+                crate::error!(format!("Cleanup failed: {cleanup:#}. Clean up by hand (drop the trigger first, it needs the lock; until then writes go to the audit table)"),
+                    { "cleanup_sql": ctx.manual_cleanup_sql() });
             }
             Err(e)
         }
@@ -141,7 +144,13 @@ impl Ctx {
                 .audit_table_pk_sequence
                 .clone()
                 .ok_or_else(|| anyhow!("audit table sequence not found"))?;
-            let (audit, table) = (&self.audit_table, &self.opts.table_name);
+            // schema-qualified: the trigger runs with the search_path of whoever writes to the table
+            let audit = format!(
+                "{}.{}",
+                quote_ident(&self.opts.schema),
+                quote_ident(&self.audit_table)
+            );
+            let table = &self.opts.table_name;
             let sql = format!(
                 r#"DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON {table};
 
@@ -150,13 +159,13 @@ RETURNS TRIGGER AS
 $$
 BEGIN
   IF ( TG_OP = 'INSERT') THEN
-    INSERT INTO "{audit}" select nextval('{seq}'), 'INSERT', clock_timestamp(), NEW.* ;
+    INSERT INTO {audit} select nextval('{seq}'), 'INSERT', clock_timestamp(), NEW.* ;
     RETURN NEW;
   ELSIF ( TG_OP = 'UPDATE') THEN
-    INSERT INTO "{audit}" select nextval('{seq}'), 'UPDATE', clock_timestamp(),  NEW.* ;
+    INSERT INTO {audit} select nextval('{seq}'), 'UPDATE', clock_timestamp(),  NEW.* ;
     RETURN NEW;
   ELSIF ( TG_OP = 'DELETE') THEN
-    INSERT INTO "{audit}" select nextval('{seq}'), 'DELETE', clock_timestamp(), OLD.* ;
+    INSERT INTO {audit} select nextval('{seq}'), 'DELETE', clock_timestamp(), OLD.* ;
     RETURN NEW;
   END IF;
 END;
@@ -678,24 +687,78 @@ DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON {old};
         Ok(())
     }
 
+    /// Trigger first (only when it is there, under lock_timeout, retried),
+    /// then the audit and shadow tables: dropping the audit table while the
+    /// trigger still writes into it would fail every write to the table.
     pub fn drop_and_cleanup(&mut self, drop_primary: bool) -> Result<()> {
+        crate::info!("Cleaning up", { "audit_table": self.audit_table, "shadow_table": self.shadow_table });
+        self.drop_audit_trigger()?;
         let primary_drop = if drop_primary {
             format!("DROP TABLE IF EXISTS {};", self.old_primary_table)
         } else {
             String::new()
         };
         let sql = format!(
-            "DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON {};
-DROP TABLE IF EXISTS {};
+            "DROP TABLE IF EXISTS {};
 DROP TABLE IF EXISTS {};
 {}
 RESET statement_timeout;
 RESET client_min_messages;
 RESET lock_timeout;",
-            self.opts.table_name, self.audit_table, self.shadow_table, primary_drop
+            self.audit_table, self.shadow_table, primary_drop
         );
         self.db.run(&sql, false)?;
+        self.flags.set_cleanup_sql(None);
         Ok(())
+    }
+
+    fn audit_trigger_exists(&mut self) -> Result<bool> {
+        let sql = format!(
+            "SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass({}) AND tgname = 'primary_to_audit_table_trigger';",
+            quote_literal(&format!("{}.{}", quote_ident(&self.opts.schema), self.opts.table_name))
+        );
+        Ok(!self.db.run(&sql, false)?.is_empty())
+    }
+
+    /// DROP TRIGGER takes ACCESS EXCLUSIVE on the table, even with IF EXISTS
+    /// and no trigger: without a lock_timeout it would wait behind any long
+    /// query and stall every query on the table queued behind it. So: only
+    /// when the trigger exists, with lock_timeout, until it succeeds (a second
+    /// signal exits and logs the SQL to finish by hand).
+    fn drop_audit_trigger(&mut self) -> Result<()> {
+        let mut attempt = 0;
+        while self.audit_trigger_exists()? {
+            attempt += 1;
+            let sql = format!(
+                "SET LOCAL lock_timeout = '{}s';\nDROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON {};",
+                self.opts.wait_time_for_lock.max(1),
+                self.opts.table_name
+            );
+            match self.db.run(&sql, false) {
+                Ok(_) => {
+                    crate::info!("Audit trigger dropped");
+                    return Ok(());
+                }
+                Err(e) if sqlstate(&e) == Some(&SqlState::LOCK_NOT_AVAILABLE) => {
+                    crate::warn!(format!(
+                        "Couldn't get the lock to drop the audit trigger, attempt {attempt}, retrying (long transactions on the table block it)"
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// What drop_and_cleanup does, to run by hand.
+    pub fn manual_cleanup_sql(&self) -> String {
+        let s = quote_ident(&self.opts.schema);
+        format!(
+            "SET lock_timeout = '5s'; DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON {s}.{t}; RESET lock_timeout; DROP TABLE IF EXISTS {s}.{a}; DROP TABLE IF EXISTS {s}.{sh};",
+            t = self.opts.table_name,
+            a = self.audit_table,
+            sh = self.shadow_table
+        )
     }
 
     fn storage_params_reset(&self) -> String {

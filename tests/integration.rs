@@ -718,3 +718,90 @@ fn vacuum_runs_by_default_and_can_be_skipped() {
         assert_eq!(vacuum_count_of_old_table(&mut t), expected, "{name}");
     }
 }
+
+#[test]
+fn cleanup_waits_for_the_trigger_lock_without_blocking_writes() {
+    let mut t = TestDb::new("cleanup_lock");
+    let s = t.schema.clone();
+    let mut a = args(
+        &s,
+        "ALTER TABLE books ADD COLUMN purchased BOOLEAN DEFAULT FALSE;",
+    );
+    a.wait_for_swap = true;
+    a.wait_time_for_lock = 1;
+    let (flags, handle) = spawn_perform(a);
+    wait_for_sync(&mut t, 3);
+    assert!(flags
+        .cleanup_sql()
+        .unwrap()
+        .contains("DROP TRIGGER IF EXISTS"));
+
+    // a long transaction on the table: DROP TRIGGER can't get its lock
+    let mut blocker = Db::connect(&conn(&s)).unwrap();
+    blocker
+        .run(&format!("SELECT count(*) FROM \"{s}\".books"), true)
+        .unwrap();
+    flags.terminate.store(15, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(!handle.is_finished(), "cleanup must wait for the lock");
+    // the trigger and its audit table are still there, writes keep working
+    // (each wait for the lock is limited to lock_timeout)
+    assert_eq!(t.pgosc_tables().len(), 2);
+    let mut writer = Db::connect(&conn(&s)).unwrap();
+    writer.run("SET lock_timeout = '3s'", false).unwrap();
+    writer.run(&format!("INSERT INTO \"{s}\".books(seller_id, username, password, email, \"createdOn\") VALUES (1, 'during', 'x', 'during@b.c', now())"), false).unwrap();
+
+    blocker.run("COMMIT", false).unwrap();
+    let err = handle.join().unwrap().unwrap_err();
+    assert_eq!(err.downcast_ref::<Terminated>().map(|t| t.0), Some(15));
+    assert!(t.pgosc_tables().is_empty());
+    assert!(flags.cleanup_sql().is_none());
+    t.exec(&format!("SET search_path TO \"{s}\""));
+    assert!(t.values("SELECT 1 FROM pg_trigger WHERE tgrelid = 'books'::regclass AND tgname = 'primary_to_audit_table_trigger'").is_empty());
+    assert_eq!(t.values("SELECT count(*) FROM books"), vec!["4"]);
+}
+
+#[test]
+fn binary_cleans_up_on_sighup() {
+    // a closed ssh session / terminal sends HUP: used to kill the process
+    // without cleanup, leaving the trigger on the table
+    let mut t = TestDb::new("sighup");
+    let s = t.schema.clone();
+    let c = conn_args(&s);
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_pg-online-schema-change"))
+        .args([
+            "perform",
+            "-a",
+            "ALTER TABLE books ADD COLUMN purchased BOOLEAN DEFAULT FALSE",
+            "-d",
+            &c.dbname,
+            "-h",
+            &c.host,
+            "-u",
+            &c.username,
+            "-p",
+            &c.port.to_string(),
+            "-s",
+            &s,
+            "--sslmode",
+            "disable",
+            "--wait-for-swap",
+            "--sync-interval",
+            "0.05",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_sync(&mut t, 3);
+    std::process::Command::new("kill")
+        .args(["-HUP", &child.id().to_string()])
+        .status()
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(129), "{stdout}");
+    assert!(stdout.contains("Audit trigger dropped"), "{stdout}");
+    assert!(t.pgosc_tables().is_empty());
+    t.exec(&format!("SET search_path TO \"{s}\""));
+    assert!(t.values("SELECT 1 FROM pg_trigger WHERE tgrelid = 'books'::regclass AND tgname = 'primary_to_audit_table_trigger'").is_empty());
+}
