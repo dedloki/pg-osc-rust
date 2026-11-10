@@ -4,6 +4,7 @@
 
 #[macro_use]
 pub mod log;
+pub mod carry;
 pub mod ctx;
 pub mod db;
 pub mod functions;

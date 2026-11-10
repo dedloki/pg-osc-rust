@@ -155,7 +155,7 @@ impl Ctx {
     }
 
     /// schema-qualified, for regclass casts
-    fn qualified(&self, table: &str) -> String {
+    pub(crate) fn qualified(&self, table: &str) -> String {
         format!("{}.{}", quote_ident(&self.opts.schema), table)
     }
 
@@ -265,12 +265,16 @@ impl Ctx {
         if c.definition.ends_with("NOT VALID") {
             format!(
                 "ALTER TABLE {} ADD CONSTRAINT {} {};",
-                c.table_on, c.constraint_name, c.definition
+                c.table_on,
+                quote_ident(&c.constraint_name),
+                c.definition
             )
         } else {
             format!(
                 "ALTER TABLE {} ADD CONSTRAINT {} {} NOT VALID;",
-                c.table_on, c.constraint_name, c.definition
+                c.table_on,
+                quote_ident(&c.constraint_name),
+                c.definition
             )
         }
     }
@@ -284,7 +288,7 @@ impl Ctx {
                 format!(
                     "ALTER TABLE {} DROP CONSTRAINT {}; {}",
                     c.table_on,
-                    c.constraint_name,
+                    quote_ident(&c.constraint_name),
                     Self::add_constraint_statement(c)
                 )
             })
@@ -313,7 +317,8 @@ impl Ctx {
             .map(|c| {
                 format!(
                     "ALTER TABLE {} VALIDATE CONSTRAINT {};",
-                    c.table_on, c.constraint_name
+                    c.table_on,
+                    quote_ident(&c.constraint_name)
                 )
             })
             .collect())

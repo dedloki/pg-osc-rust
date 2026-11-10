@@ -883,3 +883,210 @@ fn table_rewrite_during_batched_copy_fails() {
 fn table_rewrite_during_batched_copy_restarts() {
     rewrite_during_copy("rewrite_restart", RewriteAction::Restart);
 }
+
+fn ensure_role(t: &mut TestDb, role: &str) {
+    // roles are cluster-wide and the tests run in parallel
+    t.exec(&format!(
+        "DO $$ BEGIN CREATE ROLE {role}; EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+    ));
+}
+
+/// CREATE TABLE ... LIKE ... INCLUDING ALL doesn't copy owner, grants, RLS,
+/// policies, replica identity, publications, the table comment and column
+/// statistics, and names indexes after the shadow table: the swap carries
+/// them over (upstream issues 197 and 20). A foreign key with a mixed case
+/// name used to break the swap (upstream issue 196).
+#[test]
+fn swap_carries_properties_names_and_quoted_constraints() {
+    let mut t = TestDb::new("carry");
+    let s = t.schema.clone();
+    let role = "pgosc_test_reader";
+    let owner = "pgosc_test_owner";
+    ensure_role(&mut t, role);
+    ensure_role(&mut t, owner);
+    let publication = format!("{s}_pub");
+    t.exec(&format!(
+        r#"SET search_path TO "{s}";
+        DROP PUBLICATION IF EXISTS {publication};
+        GRANT USAGE ON SCHEMA "{s}" TO {role};
+        GRANT SELECT ON books TO {role};
+        GRANT UPDATE (last_login) ON books TO {role};
+        ALTER TABLE books OWNER TO {owner};
+        ALTER TABLE books ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE books FORCE ROW LEVEL SECURITY;
+        CREATE POLICY seller_one ON books FOR SELECT TO {role} USING (seller_id = 1);
+        ALTER TABLE books REPLICA IDENTITY USING INDEX books_username_key;
+        ALTER TABLE books ALTER COLUMN email SET STATISTICS 300;
+        ALTER TABLE books ALTER COLUMN username SET (n_distinct = 100);
+        COMMENT ON TABLE books IS 'книги';
+        CREATE PUBLICATION {publication} FOR TABLE books;
+        ALTER TABLE chapters RENAME CONSTRAINT chapters_book_id_fkey TO "FK_Chapters_Book";
+        DROP VIEW books_view;"#
+    ));
+    let index_names = "SELECT string_agg(indexrelid::regclass::text, ',' ORDER BY indexrelid::regclass::text) FROM pg_index WHERE indrelid = 'books'::regclass";
+    let before = t.values(index_names);
+
+    let a = args(
+        &s,
+        "ALTER TABLE books RENAME COLUMN email TO new_email; ALTER TABLE books ADD COLUMN purchased boolean;",
+    );
+    let result = orchestrate::run(Options::from_args(&a).unwrap(), Arc::new(Flags::default()));
+    t.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
+    result.unwrap();
+
+    t.exec(&format!("SET search_path TO \"{s}\""));
+    assert_eq!(t.values(index_names), before, "index names restored");
+    assert_eq!(
+        t.values("SELECT relowner::regrole, relrowsecurity, relforcerowsecurity, relreplident, obj_description(oid, 'pg_class') FROM pg_class WHERE oid = 'books'::regclass"),
+        vec![format!("{owner}|t|t|i|книги")]
+    );
+    assert_eq!(
+        t.values("SELECT indexrelid::regclass FROM pg_index WHERE indrelid = 'books'::regclass AND indisreplident"),
+        vec!["books_username_key"]
+    );
+    assert_eq!(
+        t.values(&format!("SELECT has_table_privilege('{role}', 'books', 'SELECT'), has_table_privilege('{role}', 'books', 'INSERT'), has_column_privilege('{role}', 'books', 'last_login', 'UPDATE'), has_column_privilege('{role}', 'books', 'username', 'UPDATE')")),
+        vec!["t|f|t|f"]
+    );
+    assert_eq!(
+        t.values("SELECT polname, polcmd, pg_get_expr(polqual, polrelid) FROM pg_policy WHERE polrelid = 'books'::regclass"),
+        vec!["seller_one|r|(seller_id = 1)"]
+    );
+    assert_eq!(
+        t.values("SELECT attname, attstattarget, array_to_string(attoptions, ',') FROM pg_attribute WHERE attrelid = 'books'::regclass AND attname IN ('new_email', 'username') ORDER BY 1"),
+        vec!["new_email|300|NULL", "username|-1|n_distinct=100"]
+            .into_iter()
+            .map(|v| {
+                // PostgreSQL 17 shows the default statistics target as NULL
+                if t.values("SHOW server_version_num")[0].parse::<i32>().unwrap() >= 170000 {
+                    v.replace("|-1|", "|NULL|")
+                } else {
+                    v.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        t.values("SELECT conname, convalidated, confrelid::regclass FROM pg_constraint WHERE conrelid = 'chapters'::regclass AND contype = 'f'"),
+        vec!["FK_Chapters_Book|t|books"]
+    );
+    // the old table's indexes got out of the way
+    assert!(t
+        .values("SELECT indexrelid::regclass FROM pg_index WHERE indrelid = 'pgosc_op_table_books'::regclass")
+        .iter()
+        .all(|n| n.contains("_pgosc_op_")));
+}
+
+#[test]
+fn swap_moves_the_table_in_its_publications() {
+    let mut t = TestDb::new("publication");
+    let s = t.schema.clone();
+    let publication = format!("{s}_pub");
+    t.exec(&format!(
+        "DROP PUBLICATION IF EXISTS {publication}; CREATE PUBLICATION {publication} FOR TABLE \"{s}\".books;"
+    ));
+    let a = args(&s, "ALTER TABLE books ADD COLUMN purchased boolean;");
+    let result = orchestrate::run(Options::from_args(&a).unwrap(), Arc::new(Flags::default()));
+    let members = t.values(&format!(
+        "SELECT tablename FROM pg_publication_tables WHERE pubname = '{publication}' ORDER BY 1"
+    ));
+    t.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
+    result.unwrap();
+    assert_eq!(members, vec!["books"]);
+}
+
+/// While the trigger feeds the audit table, ALTER TABLE on the table would
+/// break every write to it and TRUNCATE wouldn't reach the new table: both
+/// are refused until the swap (upstream issue 15).
+#[test]
+fn alter_and_truncate_are_refused_during_the_run() {
+    let mut t = TestDb::new("ddl_guard");
+    let s = t.schema.clone();
+    let mut a = args(&s, "ALTER TABLE books ADD COLUMN purchased boolean;");
+    a.wait_for_swap = true;
+    let (_flags, handle) = spawn_perform(a);
+    wait_for_sync(&mut t, 3);
+
+    let mut other = Db::connect(&conn(&s)).unwrap();
+    let err = other
+        .run(
+            &format!("ALTER TABLE \"{s}\".books ADD COLUMN extra int"),
+            false,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("ALTER TABLE on it is refused"),
+        "{err:#}"
+    );
+    let err = other
+        .run(
+            &format!("TRUNCATE \"{s}\".chapters, \"{s}\".book_audits, \"{s}\".books"),
+            false,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("TRUNCATE is refused"),
+        "{err:#}"
+    );
+    // other tables are not affected, writes keep working
+    other
+        .run(
+            &format!("ALTER TABLE \"{s}\".sellers ADD COLUMN extra int"),
+            false,
+        )
+        .unwrap();
+    other.run(&format!("INSERT INTO \"{s}\".books(seller_id, username, password, email, \"createdOn\") VALUES (1, 'g', 'x', 'g@b.c', now())"), false).unwrap();
+
+    request_swap(&conn(&s), &s, "books").unwrap();
+    handle.join().unwrap().unwrap();
+    // gone with the swap
+    other
+        .run(
+            &format!("ALTER TABLE \"{s}\".books ADD COLUMN extra int"),
+            false,
+        )
+        .unwrap();
+    other
+        .run(
+            &format!("TRUNCATE \"{s}\".pgosc_op_table_books CASCADE"),
+            false,
+        )
+        .unwrap();
+    t.exec(&format!("SET search_path TO \"{s}\""));
+    assert!(t
+        .values("SELECT evtname FROM pg_event_trigger e JOIN pg_proc p ON p.oid = e.evtfoid WHERE p.pronamespace = current_schema::regnamespace")
+        .is_empty());
+    assert!(t
+        .values("SELECT proname FROM pg_proc WHERE pronamespace = current_schema::regnamespace AND proname LIKE 'pgosc_%guard%'")
+        .is_empty());
+}
+
+#[test]
+fn preflight_refuses_leftovers_and_partitioned_tables() {
+    let mut t = TestDb::new("preflight");
+    let s = t.schema.clone();
+    t.exec(&format!(
+        r#"SET search_path TO "{s}";
+        CREATE TABLE pgosc_op_table_books (id int);
+        CREATE TABLE parted (id int PRIMARY KEY) PARTITION BY RANGE (id);
+        CREATE TABLE parted_1 PARTITION OF parted FOR VALUES FROM (0) TO (100);"#
+    ));
+    let a = args(&s, "ALTER TABLE books ADD COLUMN purchased boolean;");
+    let err =
+        orchestrate::run(Options::from_args(&a).unwrap(), Arc::new(Flags::default())).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("pgosc_op_table_books already exists"),
+        "{err:#}"
+    );
+    assert_eq!(t.pgosc_tables(), vec!["pgosc_op_table_books"]);
+
+    for table in ["parted", "parted_1"] {
+        let a = args(&s, &format!("ALTER TABLE {table} ADD COLUMN x int;"));
+        let err = orchestrate::run(Options::from_args(&a).unwrap(), Arc::new(Flags::default()))
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Partitioned tables"),
+            "{table}: {err:#}"
+        );
+    }
+}

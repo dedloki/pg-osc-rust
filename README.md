@@ -50,6 +50,14 @@ pg-online-schema-change perform \
 - On failure the old table is never dropped, even with `--drop`.
 - Foreign keys from other tables pointing to filtered-out rows fail `VALIDATE CONSTRAINT` after the swap (the swap is done by then, the constraints stay `NOT VALID`). Fix those rows first or use `--skip-foreign-key-validation`.
 
+### Guards and what the swap carries over
+
+- **Before anything is created** the run refuses partitioned tables and partitions, a leftover `pgosc_op_table_<table>` from a previous run without `--drop` (the swap renames the table to that name), and a user that can't give the new table the old one's owner or add it to the old one's publications (a superuser or a member of those roles can).
+- **During the run** `TRUNCATE` of the table is refused by a statement trigger (it wouldn't reach the new table), and `ALTER TABLE` of it by an event trigger: a changed column list would make every write to the table fail, the audit table has the old columns. The event trigger needs a superuser; without one there is only a warning. Both go away with the swap or the cleanup (`DROP EVENT TRIGGER pgosc_ddl_guard_<id>` forces an `ALTER` through).
+- **The swap carries over** what `CREATE TABLE ... (LIKE ... INCLUDING ALL)` doesn't copy: owner, table and column grants, row level security (`ENABLE`/`FORCE`) and policies, replica identity, publication membership (with column lists and row filters on PostgreSQL 15+; the old table leaves those publications), the table comment, per-column statistics targets and options. Index and constraint names are restored: the old table's indexes get a `_pgosc_op_<n>` suffix, the new ones the original names. An index without a counterpart of the same definition (e.g. an expression over a renamed column) keeps its `pgosc_st_...` name with a warning. Right after the copy all of it is tried on the shadow table in a rolled back transaction, so a missing privilege shows up before the sync, not at the swap.
+- Logical replication: the subscriber sees a new relation; run `ALTER SUBSCRIPTION ... REFRESH PUBLICATION` there after the swap and check that it doesn't copy the table again (`copy_data = false` if the data is already there).
+- Foreign key constraint names are quoted, mixed case names work. Sequence names of serial columns still get the `pgosc_st_...` prefix.
+
 ### Stopping and cleanup
 
 `SIGTERM`, `SIGINT` (Ctrl-C), `SIGQUIT` and `SIGHUP` (closed ssh session, terminal or tmux window) stop the run and clean up: the audit trigger is dropped first, then the audit and shadow tables. `DROP TRIGGER` needs an `ACCESS EXCLUSIVE` lock on the table, so it is tried with `lock_timeout = --wait-time-for-lock` and retried until it gets through (each attempt is logged); writes to the table wait at most that long behind it, and keep going to the audit table meanwhile. A second signal exits at once and logs `cleanup_sql`, the statements to finish by hand. Drop the trigger before the audit table: while the trigger is there, dropping the audit table breaks every write to the table. `kill -9` leaves everything in place, clean up with the same statements:
@@ -58,6 +66,8 @@ pg-online-schema-change perform \
 SET lock_timeout = '5s';
 DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON public.<table>;  -- repeat until it succeeds
 RESET lock_timeout;
+DROP TRIGGER IF EXISTS pgosc_truncate_guard_<id> ON public.<table>;
+DROP EVENT TRIGGER IF EXISTS pgosc_ddl_guard_<id>;
 DROP TABLE IF EXISTS public.pgosc_at_<table>_<id>;
 DROP TABLE IF EXISTS public.pgosc_st_<table>_<id>;
 ```

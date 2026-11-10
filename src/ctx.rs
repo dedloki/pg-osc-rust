@@ -58,6 +58,9 @@ impl std::fmt::Display for AccessExclusiveLockNotAcquired {
 impl std::error::Error for AccessExclusiveLockNotAcquired {}
 
 pub struct Ctx {
+    /// random id of this run, part of every name it creates
+    pub id: String,
+    pub server_version: i64,
     pub opts: Options,
     pub db: Db,
     pub flags: Arc<Flags>,
@@ -88,6 +91,8 @@ impl Ctx {
     pub fn new(opts: Options, db: Db, flags: Arc<Flags>, id: &str) -> Self {
         let t = opts.table.to_lowercase();
         Self {
+            id: id.to_string(),
+            server_version: 0,
             old_primary_table: format!("pgosc_op_table_{t}"),
             audit_table: format!("pgosc_at_{t}_{id}"),
             operation_type_column: format!("operation_type_{id}"),

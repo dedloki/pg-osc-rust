@@ -32,6 +32,7 @@ pub fn setup(opts: Options, flags: Arc<Flags>) -> Result<Ctx> {
     ctx.db.run(&sql, false)?;
     ctx.db.run(FUNC_FIX_SERIAL_SEQUENCE, false)?;
     ctx.db.run(FUNC_CREATE_TABLE_ALL, false)?;
+    ctx.server_version = ctx.server_version_num()?;
 
     let table_name = ctx.opts.table_name.clone();
     ctx.primary_table_storage_parameters = ctx
@@ -84,8 +85,9 @@ fn run_steps(ctx: &mut Ctx) -> Result<()> {
     if ctx.primary_key()?.is_none() {
         bail!("Parent table has no primary key, exiting...");
     }
+    ctx.preflight()?;
     if ctx.batched() {
-        let version = ctx.server_version_num()?;
+        let version = ctx.server_version;
         if version < 140000 {
             bail!("--copy-batch-pages needs PostgreSQL 14+ (TID range scans), the server is {version}");
         }
@@ -105,6 +107,7 @@ fn run_steps(ctx: &mut Ctx) -> Result<()> {
     ctx.run_alter_statement()?; // same transaction
     ctx.copy_data()?; // same transaction, commits it
     ctx.finish_copy()?; // dedup after batches, deferred indexes
+    ctx.check_carry()?; // the swap will be able to carry grants, owner, ...
     ctx.run_analyze()?;
     ctx.replay_and_swap()?;
     ctx.run_analyze()?;
@@ -177,6 +180,7 @@ FOR EACH ROW EXECUTE PROCEDURE primary_to_audit_table_trigger();
 "#
             );
             self.db.run(&sql, true)?;
+            self.setup_guards()?;
             Ok(())
         })();
         let commit = self.db.run("COMMIT;", false);
@@ -637,8 +641,16 @@ FOR EACH ROW EXECUTE PROCEDURE primary_to_audit_table_trigger();
                 true,
             )?;
 
+            // ALTER TABLE on the table is ours from here on (rolled back with the swap)
+            let drop_guard = self.drop_ddl_guard_sql(true)?;
+            self.db.run(&drop_guard, true)?;
             let rows = self.rows_to_play(true)?;
             self.play(&rows, true)?;
+            // before the renames, while the source is still `table_name`
+            let carry = self.capture_carry()?;
+            for w in &carry.warnings {
+                crate::warn!(w.clone());
+            }
 
             let primary_key = self
                 .primary_key()?
@@ -655,7 +667,20 @@ ALTER TABLE {shadow} RENAME to {t};
 {storage}
 DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON {t};
 DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON {old};
+DROP TRIGGER IF EXISTS {truncate_guard} ON {old};
+{old_table}
+{names}
+{properties}
 ",
+                truncate_guard = self.truncate_guard_name(),
+                old_table = carry.old_table_statements.join("\n"),
+                names = carry.name_statements.join("\n"),
+                properties = carry
+                    .statements
+                    .iter()
+                    .map(|s| format!("{s};"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
                 old = self.old_primary_table,
                 shadow = self.shadow_table,
                 ref_fk = self.referential_foreign_key_statements,
@@ -720,6 +745,22 @@ DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON {old};
     /// then the audit and shadow tables: dropping the audit table while the
     /// trigger still writes into it would fail every write to the table.
     pub fn drop_and_cleanup(&mut self, drop_primary: bool) -> Result<()> {
+        // the cancel request sent on a stop signal is asynchronous: it can land
+        // on one of the cleanup statements instead of the query it was meant
+        // for. Every step is idempotent, so just go again.
+        let mut attempt = 1;
+        loop {
+            match self.drop_and_cleanup_once(drop_primary) {
+                Err(e) if sqlstate(&e) == Some(&SqlState::QUERY_CANCELED) && attempt < 3 => {
+                    crate::warn!("Cleanup statement canceled (late cancel request of the stop signal), retrying");
+                    attempt += 1;
+                }
+                r => return r,
+            }
+        }
+    }
+
+    fn drop_and_cleanup_once(&mut self, drop_primary: bool) -> Result<()> {
         crate::info!("Cleaning up", { "audit_table": self.audit_table, "shadow_table": self.shadow_table });
         self.drop_audit_trigger()?;
         let primary_drop = if drop_primary {
@@ -727,14 +768,22 @@ DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON {old};
         } else {
             String::new()
         };
+        let drop_guard = self.drop_ddl_guard_sql(false)?;
         let sql = format!(
-            "DROP TABLE IF EXISTS {};
+            "{drop_guard}
+DROP FUNCTION IF EXISTS {ddl_guard}();
+DROP FUNCTION IF EXISTS {truncate_guard}();
+DROP TABLE IF EXISTS {};
 DROP TABLE IF EXISTS {};
 {}
 RESET statement_timeout;
 RESET client_min_messages;
 RESET lock_timeout;",
-            self.audit_table, self.shadow_table, primary_drop
+            self.audit_table,
+            self.shadow_table,
+            primary_drop,
+            ddl_guard = self.ddl_guard_name(),
+            truncate_guard = self.truncate_guard_name(),
         );
         self.db.run(&sql, false)?;
         self.flags.set_cleanup_sql(None);
@@ -743,8 +792,9 @@ RESET lock_timeout;",
 
     fn audit_trigger_exists(&mut self) -> Result<bool> {
         let sql = format!(
-            "SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass({}) AND tgname = 'primary_to_audit_table_trigger';",
-            quote_literal(&format!("{}.{}", quote_ident(&self.opts.schema), self.opts.table_name))
+            "SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass({}) AND tgname IN ('primary_to_audit_table_trigger', {});",
+            quote_literal(&format!("{}.{}", quote_ident(&self.opts.schema), self.opts.table_name)),
+            quote_literal(&self.truncate_guard_name())
         );
         Ok(!self.db.run(&sql, false)?.is_empty())
     }
@@ -759,9 +809,10 @@ RESET lock_timeout;",
         while self.audit_trigger_exists()? {
             attempt += 1;
             let sql = format!(
-                "SET LOCAL lock_timeout = '{}s';\nDROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON {};",
+                "SET LOCAL lock_timeout = '{}s';\nDROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON {t};\nDROP TRIGGER IF EXISTS {} ON {t};",
                 self.opts.wait_time_for_lock.max(1),
-                self.opts.table_name
+                self.truncate_guard_name(),
+                t = self.opts.table_name
             );
             match self.db.run(&sql, false) {
                 Ok(_) => {
@@ -783,11 +834,93 @@ RESET lock_timeout;",
     pub fn manual_cleanup_sql(&self) -> String {
         let s = quote_ident(&self.opts.schema);
         format!(
-            "SET lock_timeout = '5s'; DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON {s}.{t}; RESET lock_timeout; DROP TABLE IF EXISTS {s}.{a}; DROP TABLE IF EXISTS {s}.{sh};",
+            "SET lock_timeout = '5s'; DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON {s}.{t}; DROP TRIGGER IF EXISTS {tg} ON {s}.{t}; RESET lock_timeout; DROP EVENT TRIGGER IF EXISTS {eg}; DROP FUNCTION IF EXISTS {s}.{eg}(); DROP FUNCTION IF EXISTS {s}.{tg}(); DROP TABLE IF EXISTS {s}.{a}; DROP TABLE IF EXISTS {s}.{sh};",
             t = self.opts.table_name,
+            tg = self.truncate_guard_name(),
+            eg = self.ddl_guard_name(),
             a = self.audit_table,
             sh = self.shadow_table
         )
+    }
+
+    pub fn ddl_guard_name(&self) -> String {
+        format!("pgosc_ddl_guard_{}", self.id)
+    }
+
+    /// DROP EVENT TRIGGER needs a superuser even with IF EXISTS, so only
+    /// when it is there.
+    fn drop_ddl_guard_sql(&mut self, reuse: bool) -> Result<String> {
+        let name = self.ddl_guard_name();
+        let exists = self.db.first_value(
+            &format!(
+                "SELECT 1 FROM pg_event_trigger WHERE evtname = {};",
+                quote_literal(&name)
+            ),
+            reuse,
+        )?;
+        Ok(if exists.is_some() {
+            format!("DROP EVENT TRIGGER {name};")
+        } else {
+            String::new()
+        })
+    }
+
+    pub fn truncate_guard_name(&self) -> String {
+        format!("pgosc_truncate_guard_{}", self.id)
+    }
+
+    /// While the trigger feeds the audit table, a change of the table's
+    /// columns would make every write to it fail (the audit table has the old
+    /// columns) and TRUNCATE isn't captured at all. TRUNCATE is refused by a
+    /// statement trigger; ALTER TABLE by an event trigger, which only a
+    /// superuser can create (otherwise a warning). Both go away with the swap
+    /// or the cleanup. Runs in the transaction that adds the audit trigger.
+    fn setup_guards(&mut self) -> Result<()> {
+        let schema = quote_ident(&self.opts.schema);
+        let table = self.opts.table_name.clone();
+        let tg = self.truncate_guard_name();
+        let sql = format!(
+            r#"CREATE OR REPLACE FUNCTION {schema}.{tg}() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'pg-osc is rebuilding table %.%: TRUNCATE is refused until it finishes (the change would not reach the new table)', TG_TABLE_SCHEMA, TG_TABLE_NAME;
+END $$;
+CREATE TRIGGER {tg} BEFORE TRUNCATE ON {table} FOR EACH STATEMENT EXECUTE PROCEDURE {schema}.{tg}();"#
+        );
+        self.db.run(&sql, true)?;
+
+        let superuser = self.db.first_value(
+            "SELECT rolsuper FROM pg_roles WHERE rolname = current_user;",
+            true,
+        )?;
+        if superuser.as_deref() != Some("t") {
+            crate::warn!(format!(
+                "Not a superuser: can't install the event trigger that refuses ALTER TABLE on {table} during the run. Don't change the table's columns until the swap: every write to it would fail"
+            ));
+            return Ok(());
+        }
+        let eg = self.ddl_guard_name();
+        let oid = self
+            .db
+            .first_value(
+                &format!(
+                    "SELECT {}::regclass::oid;",
+                    quote_literal(&self.qualified(&table))
+                ),
+                true,
+            )?
+            .unwrap_or_default();
+        let sql = format!(
+            r#"CREATE OR REPLACE FUNCTION {schema}.{eg}() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() WHERE classid = 'pg_class'::regclass AND objid = {oid}) THEN
+    RAISE EXCEPTION 'pg-osc is rebuilding table %: ALTER TABLE on it is refused until it finishes (every write would fail). To force it: DROP EVENT TRIGGER {eg}', {table_lit};
+  END IF;
+END $$;
+CREATE EVENT TRIGGER {eg} ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE PROCEDURE {schema}.{eg}();"#,
+            table_lit = quote_literal(&self.qualified(&table)),
+        );
+        self.db.run(&sql, true)?;
+        Ok(())
     }
 
     fn storage_params_reset(&self) -> String {
