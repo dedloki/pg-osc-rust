@@ -3,11 +3,21 @@
 use crate::db::ConnOpts;
 use crate::sql;
 use anyhow::{bail, Result};
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 pub const PULL_BATCH_COUNT: i64 = 1000;
 pub const DELTA_COUNT: i64 = 20;
 pub const SYNC_INTERVAL: f64 = 1.0;
+
+/// What to do when the table is rewritten during a batched copy.
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RewriteAction {
+    /// stop with an error and clean up
+    #[default]
+    Fail,
+    /// empty the shadow table and copy again from the first page
+    Restart,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -125,6 +135,9 @@ pub struct PerformArgs {
     /// Don't VACUUM the table before starting (the copy doesn't need it; on a big table it can take long)
     #[arg(long)]
     pub skip_vacuum: bool,
+    /// With --copy-batch-pages: what to do if the table is rewritten during the copy (VACUUM FULL, CLUSTER, pg_repack, pg_squeeze, rewriting ALTER TABLE move every row to a new ctid; so does TRUNCATE, which the audit doesn't capture in any mode, restart doesn't make it right). Checked in every batch.
+    #[arg(long, value_enum, default_value_t = RewriteAction::Fail)]
+    pub on_table_rewrite: RewriteAction,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -156,6 +169,7 @@ pub struct Options {
     pub defer_indexes: bool,
     pub maintenance_work_mem: Option<String>,
     pub skip_vacuum: bool,
+    pub on_table_rewrite: RewriteAction,
     /// table as Postgres sees it (unquoted)
     pub table: String,
     /// table as it goes into SQL (quoted if needed)
@@ -228,6 +242,7 @@ impl Options {
             defer_indexes: a.defer_indexes,
             maintenance_work_mem: a.maintenance_work_mem.clone(),
             skip_vacuum: a.skip_vacuum,
+            on_table_rewrite: a.on_table_rewrite,
             table,
             table_name,
         })

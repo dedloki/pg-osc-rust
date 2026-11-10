@@ -3,7 +3,7 @@
 use crate::ctx::{random_id, AccessExclusiveLockNotAcquired, Ctx, Flags};
 use crate::db::{is_pg_error, sqlstate, Db};
 use crate::functions::{FUNC_CREATE_TABLE_ALL, FUNC_FIX_SERIAL_SEQUENCE};
-use crate::options::Options;
+use crate::options::{Options, RewriteAction};
 use crate::query::get_table_size;
 use crate::sql::{
     alter_statement_for, dropped_columns, quote_ident, quote_literal, renamed_columns,
@@ -283,7 +283,9 @@ FOR EACH ROW EXECUTE PROCEDURE primary_to_audit_table_trigger();
     fn copy_data_batched(&mut self) -> Result<()> {
         let pages_per_batch = self.opts.copy_batch_pages.unwrap_or(1);
         let table = self.opts.table_name.clone();
-        let total_pages = self.relation_pages(&table)?;
+        // before the page count: a rewrite in between is caught by the first batch
+        let mut filenode = self.relation_filenode(&table)?;
+        let mut total_pages = self.relation_pages(&table)?;
         let (insert, select) = self.copy_columns(false)?;
         let filter = self
             .opts
@@ -308,6 +310,7 @@ FOR EACH ROW EXECUTE PROCEDURE primary_to_audit_table_trigger();
         let mut last_log = Instant::now();
         let mut copied: u64 = 0;
         let mut start: u64 = 0;
+        let mut restarts = 0u32;
         loop {
             self.check_terminate()?;
             let end = start + pages_per_batch;
@@ -329,7 +332,33 @@ FOR EACH ROW EXECUTE PROCEDURE primary_to_audit_table_trigger();
                 filter,
                 on_conflict
             );
-            copied += self.db.execute(&sql, false)?;
+            // the INSERT locks the table till the end of the batch, a rewrite
+            // can't happen after it: check in the same transaction
+            let n = self.db.execute(&sql, true)?;
+            let now = self.relation_filenode_in_tx(&table)?;
+            if now != filenode {
+                self.db.run("ROLLBACK;", false)?;
+                let msg = format!(
+                    "The table was rewritten during the batched copy (VACUUM FULL, CLUSTER, pg_repack, pg_squeeze, TRUNCATE or a rewriting ALTER TABLE): row addresses changed, the pages copied so far don't line up with the rest. Relfilenode {filenode} -> {now}"
+                );
+                match self.opts.on_table_rewrite {
+                    RewriteAction::Fail => bail!("{msg}. Don't run those on the table during the copy, or use --on-table-rewrite restart"),
+                    RewriteAction::Restart => {
+                        crate::warn!(format!("{msg}. Restarting the copy from the first page (--on-table-rewrite restart)"));
+                        // the audit table is kept: it has every change since the trigger
+                        self.db.run(&format!("TRUNCATE {};", self.shadow_table), false)?;
+                        filenode = self.relation_filenode(&table)?;
+                        total_pages = self.relation_pages(&table)?;
+                        copied = 0;
+                        start = 0;
+                        restarts += 1;
+                        crate::info!("Copying contents in batches again..", { "pages": total_pages, "restarts": restarts });
+                        continue;
+                    }
+                }
+            }
+            self.db.run("COMMIT;", false)?;
+            copied += n;
 
             let done = end.min(total_pages);
             if last || last_log.elapsed() >= TRACK_PROGRESS_INTERVAL {

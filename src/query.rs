@@ -94,6 +94,25 @@ impl Ctx {
             .unwrap_or(0))
     }
 
+    /// Changes on every rewrite of the table (VACUUM FULL, CLUSTER, TRUNCATE,
+    /// rewriting ALTER TABLE, pg_repack, pg_squeeze), so ctids may have moved.
+    pub fn relation_filenode(&mut self, table: &str) -> Result<String> {
+        self.filenode_query(table, false)
+    }
+
+    /// Same, inside the open transaction.
+    pub fn relation_filenode_in_tx(&mut self, table: &str) -> Result<String> {
+        self.filenode_query(table, true)
+    }
+
+    fn filenode_query(&mut self, table: &str, reuse: bool) -> Result<String> {
+        let sql = format!(
+            "SELECT pg_relation_filenode({}::regclass);",
+            quote_literal(&self.qualified(table))
+        );
+        Ok(self.db.first_value(&sql, reuse)?.unwrap_or_default())
+    }
+
     /// Indexes of the shadow table, primary key first.
     pub fn shadow_indexes(&mut self, reuse: bool) -> Result<Vec<ShadowIndex>> {
         let sql = format!(

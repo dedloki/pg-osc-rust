@@ -5,7 +5,7 @@
 
 use pg_osc::ctx::{Flags, Terminated};
 use pg_osc::db::{ConnOpts, Db};
-use pg_osc::options::{ConnArgs, Options, PerformArgs};
+use pg_osc::options::{ConnArgs, Options, PerformArgs, RewriteAction};
 use pg_osc::orchestrate::{self, request_swap};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -46,6 +46,7 @@ fn args(schema: &str, alter: &str) -> PerformArgs {
         defer_indexes: false,
         maintenance_work_mem: None,
         skip_vacuum: false,
+        on_table_rewrite: RewriteAction::Fail,
     }
 }
 
@@ -804,4 +805,81 @@ fn binary_cleans_up_on_sighup() {
     assert!(t.pgosc_tables().is_empty());
     t.exec(&format!("SET search_path TO \"{s}\""));
     assert!(t.values("SELECT 1 FROM pg_trigger WHERE tgrelid = 'books'::regclass AND tgname = 'primary_to_audit_table_trigger'").is_empty());
+}
+
+/// VACUUM FULL in the middle of a batched copy moves every row to a new ctid.
+/// `fail` stops with an error, `restart` copies again and ends up correct.
+fn rewrite_during_copy(name: &str, action: RewriteAction) {
+    let mut t = TestDb::new(name);
+    let s = t.schema.clone();
+    // the filter calls a slow function so the copy takes a few seconds
+    t.exec(&format!(
+        r#"SET search_path TO "{s}";
+        CREATE TABLE barcode (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), stock_id int, barcode text NOT NULL UNIQUE);
+        INSERT INTO barcode (stock_id, barcode)
+          SELECT CASE WHEN g % 4 = 0 THEN NULL ELSE g END, 'bc' || g FROM generate_series(1, 20000) g;
+        DELETE FROM barcode WHERE stock_id % 3 = 0; -- holes, so VACUUM FULL really moves rows
+        CREATE FUNCTION slow(v int) RETURNS boolean LANGUAGE plpgsql AS $$
+        BEGIN IF v % 50 = 0 THEN PERFORM pg_sleep(0.01); END IF; RETURN true; END $$;"#
+    ));
+    let mut a = args(
+        &s,
+        "ALTER TABLE barcode ALTER COLUMN stock_id SET NOT NULL;",
+    );
+    a.filter = Some("stock_id IS NOT NULL AND slow(stock_id)".into());
+    a.copy_batch_pages = Some(1);
+    a.wait_for_swap = true;
+    a.on_table_rewrite = action;
+    let (_flags, handle) = spawn_perform(a);
+
+    wait_until("copy in progress", || {
+        t.pgosc_tables()
+            .iter()
+            .find(|n| n.starts_with("pgosc_st_"))
+            .is_some_and(|shadow| {
+                t.values(&format!("SELECT count(*) > 0 FROM \"{s}\".{shadow}"))[0] == "t"
+            })
+    });
+    t.db.exec_raw(&format!("VACUUM FULL \"{s}\".barcode"))
+        .unwrap();
+    t.exec(&format!(
+        "UPDATE \"{s}\".barcode SET barcode = barcode || '-x' WHERE stock_id % 7 = 0"
+    ));
+
+    match action {
+        RewriteAction::Fail => {
+            wait_until("the copy to stop with an error", || handle.is_finished());
+            let err = handle.join().unwrap().unwrap_err();
+            assert!(
+                format!("{err:#}").contains("rewritten during the batched copy"),
+                "{err:#}"
+            );
+            assert!(t.pgosc_tables().is_empty());
+        }
+        RewriteAction::Restart => {
+            wait_for_sync(&mut t, 1);
+            request_swap(&conn(&s), &s, "barcode").unwrap();
+            handle.join().unwrap().unwrap();
+            t.exec(&format!("SET search_path TO \"{s}\""));
+            let old = "pgosc_op_table_barcode WHERE stock_id IS NOT NULL";
+            assert_eq!(
+                t.values(&format!(
+                    "SELECT (SELECT count(*) FROM (SELECT * FROM barcode EXCEPT SELECT * FROM {old}) d),
+                            (SELECT count(*) FROM (SELECT * FROM {old} EXCEPT SELECT * FROM barcode) d),
+                            (SELECT count(*) FROM barcode)"
+                )),
+                vec![format!("0|0|{}", t.values(&format!("SELECT count(*) FROM {old}"))[0])]
+            );
+        }
+    }
+}
+
+#[test]
+fn table_rewrite_during_batched_copy_fails() {
+    rewrite_during_copy("rewrite_fail", RewriteAction::Fail);
+}
+
+#[test]
+fn table_rewrite_during_batched_copy_restarts() {
+    rewrite_during_copy("rewrite_restart", RewriteAction::Restart);
 }
