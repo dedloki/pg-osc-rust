@@ -295,12 +295,23 @@ impl Ctx {
             .collect())
     }
 
+    /// Run in the swap after the renames: the table's own foreign keys move
+    /// to the new table. The old table loses them, otherwise it stays a child
+    /// of the referenced tables (every ON DELETE CASCADE would also go
+    /// through the frozen old table, and a delete there needs its locks).
     pub fn self_foreign_keys_to_refresh(&mut self, table: &str) -> Result<String> {
+        let old = self.qualified(&self.old_primary_table);
         Ok(self
             .get_all_constraints()?
             .iter()
             .filter(|c| c.table_on == table && c.constraint_type == "f")
-            .map(Self::add_constraint_statement)
+            .map(|c| {
+                format!(
+                    "{} ALTER TABLE {old} DROP CONSTRAINT {};",
+                    Self::add_constraint_statement(c),
+                    quote_ident(&c.constraint_name)
+                )
+            })
             .collect())
     }
 

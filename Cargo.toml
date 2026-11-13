@@ -1,6 +1,6 @@
 [package]
 name = "pg-osc"
-version = "0.12.0"
+version = "0.12.1"
 edition = "2021"
 description = "Online schema change for PostgreSQL with minimal locks (Rust port of pg-osc)"
 license = "MIT"

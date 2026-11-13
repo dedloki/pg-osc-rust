@@ -863,7 +863,7 @@ dependencies = [
 
 [[package]]
 name = "pg-osc"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "chrono",

@@ -111,9 +111,24 @@ fn run_steps(ctx: &mut Ctx) -> Result<()> {
     ctx.run_analyze()?;
     ctx.replay_and_swap()?;
     ctx.run_analyze()?;
-    ctx.validate_constraints()?;
+    // the swap is done: a foreign key that doesn't validate (rows pointing
+    // nowhere) is reported, it doesn't stop the rest
+    let not_validated = ctx.validate_constraints()?;
     ctx.replace_views()?;
-    ctx.drop_and_cleanup(ctx.opts.drop)?;
+    let drop = ctx.opts.drop && not_validated.is_empty();
+    if ctx.opts.drop && !drop {
+        crate::warn!(format!(
+            "Not dropping {} (--drop): some foreign keys didn't validate, it may be needed to sort out the rows",
+            ctx.old_primary_table
+        ));
+    }
+    ctx.drop_and_cleanup(drop)?;
+    if !not_validated.is_empty() {
+        crate::warn!(
+            "Swap done, but some foreign keys stay NOT VALID: fix the rows they point from and run the statements by hand",
+            { "validate_sql": not_validated }
+        );
+    }
     Ok(())
 }
 
@@ -716,16 +731,27 @@ DROP TRIGGER IF EXISTS {truncate_guard} ON {old};
         self.db.exec_raw(&sql)
     }
 
-    pub fn validate_constraints(&mut self) -> Result<()> {
+    /// Validates the foreign keys re-created NOT VALID by the swap. Returns
+    /// the statements that failed (a violation is logged and skipped, the
+    /// constraint stays NOT VALID and still checks new writes).
+    pub fn validate_constraints(&mut self) -> Result<Vec<String>> {
         if self.opts.skip_foreign_key_validation {
-            return Ok(());
+            return Ok(vec![]);
         }
         let table_name = self.opts.table_name.clone();
+        let mut failed = vec![];
         for statement in self.get_foreign_keys_to_validate(&table_name)? {
+            self.check_terminate()?;
             crate::info!("Validating constraints!", { "statement": statement });
-            self.db.run(&statement, false)?;
+            if let Err(e) = self.db.run(&statement, false) {
+                if self.flags.terminating().is_some() || !crate::db::is_pg_error(&e) {
+                    return Err(e);
+                }
+                crate::error!(format!("Constraint not validated, it stays NOT VALID: {e:#}"), { "statement": statement });
+                failed.push(statement);
+            }
         }
-        Ok(())
+        Ok(failed)
     }
 
     pub fn replace_views(&mut self) -> Result<()> {

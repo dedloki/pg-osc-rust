@@ -441,31 +441,71 @@ fn terminate_cleans_up_and_keeps_the_table() {
 }
 
 #[test]
-fn failure_after_swap_never_drops_the_old_table() {
+fn unvalidated_foreign_key_after_swap_is_reported_and_keeps_the_old_table() {
     let mut t = TestDb::new("keep_old");
     let s = t.schema.clone();
     t.exec(&format!(
         "SET search_path TO \"{s}\"; UPDATE books SET last_login = NULL WHERE user_id = 1"
     ));
 
-    // chapters references book 1, which is filtered out -> VALIDATE CONSTRAINT fails after the swap
+    // chapters references book 1, which is filtered out -> VALIDATE CONSTRAINT
+    // fails after the swap: reported, the rest goes on (views), the old table
+    // is kept despite --drop
     let mut a = args(
         &s,
         "ALTER TABLE books ALTER COLUMN last_login SET NOT NULL;",
     );
     a.filter = Some("last_login IS NOT NULL".into());
     a.drop = true;
-    let err =
-        orchestrate::run(Options::from_args(&a).unwrap(), Arc::new(Flags::default())).unwrap_err();
-    assert!(
-        format!("{err:#}").contains("violates foreign key"),
-        "{err:#}"
-    );
+    orchestrate::run(Options::from_args(&a).unwrap(), Arc::new(Flags::default())).unwrap();
 
+    t.exec(&format!("SET search_path TO \"{s}\""));
     assert_eq!(t.pgosc_tables(), vec!["pgosc_op_table_books"]);
     assert_eq!(
         t.values("SELECT count(*) FROM pgosc_op_table_books"),
         vec!["3"]
+    );
+    assert_eq!(
+        t.values("SELECT conrelid::regclass, convalidated FROM pg_constraint WHERE contype = 'f' AND confrelid = 'books'::regclass ORDER BY 1"),
+        vec!["book_audits|t", "chapters|f"]
+    );
+    // the view was still moved to the new table
+    assert_eq!(t.values("SELECT count(*) FROM books_view"), vec!["2"]);
+    assert!(t
+        .values("SELECT 1 FROM pg_depend d JOIN pg_rewrite r ON r.oid = d.objid WHERE d.refobjid = 'pgosc_op_table_books'::regclass")
+        .is_empty());
+}
+
+/// The table's own foreign keys move to the new table; the old one loses
+/// them, otherwise it stays a child of the referenced tables and every
+/// ON DELETE CASCADE goes through it too.
+#[test]
+fn old_table_loses_its_foreign_keys() {
+    let mut t = TestDb::new("old_fk");
+    let s = t.schema.clone();
+    t.exec(&format!(
+        r#"SET search_path TO "{s}";
+        ALTER TABLE books DROP CONSTRAINT books_seller_id_fkey;
+        ALTER TABLE books ADD CONSTRAINT "Books_Seller" FOREIGN KEY (seller_id) REFERENCES sellers ON DELETE CASCADE;
+        INSERT INTO sellers(name, "createdOn") VALUES ('other shop', now());
+        INSERT INTO books(seller_id, username, password, email, "createdOn") VALUES (2, 'other', 'x', 'o@b.c', now());"#
+    ));
+    let a = args(&s, "ALTER TABLE books ADD COLUMN purchased boolean;");
+    orchestrate::run(Options::from_args(&a).unwrap(), Arc::new(Flags::default())).unwrap();
+
+    t.exec(&format!("SET search_path TO \"{s}\""));
+    assert_eq!(
+        t.values("SELECT conname, convalidated, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'books'::regclass AND contype = 'f'"),
+        vec!["Books_Seller|t|FOREIGN KEY (seller_id) REFERENCES sellers(id) ON DELETE CASCADE"]
+    );
+    assert!(t
+        .values("SELECT conname FROM pg_constraint WHERE conrelid = 'pgosc_op_table_books'::regclass AND contype = 'f'")
+        .is_empty());
+    // the cascade reaches the new table only
+    t.exec("DELETE FROM sellers WHERE id = 2");
+    assert_eq!(
+        t.values("SELECT (SELECT count(*) FROM books WHERE seller_id = 2), (SELECT count(*) FROM pgosc_op_table_books WHERE seller_id = 2)"),
+        vec!["0|1"]
     );
 }
 

@@ -48,7 +48,8 @@ pg-online-schema-change perform \
 
   or `kill -USR1 <pid>` (the pid is in the logs). If the swap can't get its lock, the sync goes on and waits for the next request. A stop signal removes the trigger, audit and shadow tables, see below.
 - On failure the old table is never dropped, even with `--drop`.
-- Foreign keys from other tables pointing to filtered-out rows fail `VALIDATE CONSTRAINT` after the swap (the swap is done by then, the constraints stay `NOT VALID`). Fix those rows first or use `--skip-foreign-key-validation`.
+- Foreign keys are re-created `NOT VALID` by the swap and validated after it. A violation (for example rows of other tables pointing to filtered-out rows, or orphans the table already had) doesn't stop the run: it is logged, the constraint stays `NOT VALID` (new writes are still checked), the remaining steps run, and at the end a warning lists the `VALIDATE CONSTRAINT` statements to run by hand once the rows are fixed. With `--drop` the old table is then kept anyway. `--skip-foreign-key-validation` skips the validation.
+- The table's own foreign keys move to the new table and are dropped from the old one: otherwise the old table stays a child of the referenced tables, and every `ON DELETE CASCADE` from them also goes through it.
 
 ### Guards and what the swap carries over
 
